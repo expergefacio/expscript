@@ -1,0 +1,337 @@
+===============================================================================
+              GAMMA EXPOSURE TIMER — ATtiny85 / DIGISPARK
+                        Schematic and parts
+===============================================================================
+
+
+ POWER
+ =====
+
+       3 × LR44 cells in series
+       nominal ≈ 4.5 V
+
+       SW1 is simply:
+
+       BAT+ ──────o/ o───────────────────────────────────────── +V
+
+       BAT- ─────────────────────────────────────────────────── GND
+
+
+NOTE: consider 3*AAA at minimum
+
+===============================================================================
+ DIGISPARK / ATtiny85
+===============================================================================
+
+
+                            +V RAIL
+                               │
+                               │
+                         ┌─────┴─────┐
+                         │  5V / VCC │
+                         │           │
+          LCD DATA ◄─────┤ PB0 / D0  │
+                         │           │
+     BUZZER DRIVER ◄─────┤ PB1 / D1  │
+                         │           │
+    BUTTON ADC NODE ─────┤ PB2 / D2  │
+                         │   ADC1    │
+                         │           │
+            LCD CS ◄─────┤ PB3 / D3  │
+                         │           │
+            LCD WR ◄─────┤ PB4 / D4  │
+                         │           │
+                NC   X───┤ PB5/RESET │
+                         │           │
+                         │    GND    │
+                         └─────┬─────┘
+                               │
+                               │
+                            GND RAIL
+
+
+ IMPORTANT:
+
+       Supply goes to Digispark 5V/VCC
+       NOT VIN.
+
+       PB5 / RESET is left alone.
+
+       PB0 = LCD DATA
+       PB1 = buzzer
+       PB2 = buttons / ADC
+       PB3 = LCD CS
+       PB4 = LCD WR
+
+
+
+===============================================================================
+ HT1621 6-DIGIT LCD
+===============================================================================
+
+
+                             HT1621 LCD MODULE
+                         ┌──────────────────────┐
+
+        +V RAIL ─────────┤ VCC                  │
+                         │                      │
+        GND RAIL ────────┤ GND                  │
+                         │                      │
+        PB0 / D0 ────────┤ DATA                 │
+                         │                      │
+        PB3 / D3 ────────┤ CS                   │
+                         │                      │
+        PB4 / D4 ────────┤ WR                   │
+                         │                      │
+                         │ LED+             NC  │
+                         └──────────────────────┘
+                                               X
+
+
+       LED+ / backlight is NOT powered.
+
+       LCD signal wiring:
+
+           ATtiny PB0  ───────── DATA
+           ATtiny PB3  ───────── CS
+           ATtiny PB4  ───────── WR
+
+
+
+===============================================================================
+ FOUR-BUTTON ADC RESISTOR LADDER
+===============================================================================
+
+
+ Four buttons feed +V into that SAME ADC node through different resistances.
+
+
+                       R1
+ +V ────────────────/\/\/\/\/───────────o
+                     15.75 kΩ            \
+                                         \  BTN1
+                                         o─────────────┐
+                                                       │
+                                                       │
+                       R2                              │
+ +V ────────────────/\/\/\/\/───────────o              │
+                     35.16 kΩ            \             │
+                                         \  BTN2       │
+                                         o─────────────┤
+                                                       │
+                                                       │
+                       R3                              │
+ +V ────────────────/\/\/\/\/───────────o              │
+                      56.2 kΩ            \             │
+                                         \  BTN3       ├──────●──── PB2 / ADC1
+                                         o─────────────┤      │
+                                                       │      │
+                                                       │     R5
+                       R4                              │   100 kΩ
+ +V ────────────────/\/\/\/\/───────────o              │      │
+                      47.0 kΩ            \             │      │
+                                         \  SHIFT      │     GND
+                                         o─────────────┘
+
+
+ All four switches are normally open.
+
+ When no button is pressed:
+
+       R5 pulls PB2 → GND
+
+
+ When a button is pressed:
+
+       +V
+        │
+       resistor
+        │
+       button
+        │
+       PB2
+        │
+      100 kΩ
+        │
+       GND
+
+
+ Component values:
+
+       R1  BTN1       15.75 kΩ
+       R2  BTN2       35.16 kΩ
+       R3  BTN3       56.2  kΩ
+       R4  SHIFT      47.0  kΩ
+       R5  PULLDOWN   100   kΩ
+
+
+ Functions:
+
+       BTN1             +1 minute
+       SHIFT + BTN1     -1 minute
+
+       BTN2             +1 second
+       SHIFT + BTN2     -1 second
+
+       BTN3             START / PAUSE
+                        also cancels alarm
+
+       SHIFT + BTN3     reset timer to stored preset
+
+       SHIFT + BTN3
+       twice quickly    zero timer
+
+
+       HOLD SHIFT + BTN1/2     +/- 5 sec/min
+
+
+
+===============================================================================
+ BUZZER DRIVER
+===============================================================================
+
+
+                        +V
+                         │
+                         ├─────────────┐
+                         │             │
+                     [ BUZZER ]        │
+                       42 Ω            │
+                         │             │
+                         ●───────|<|───┘
+                         │        D1
+                         │
+                         C
+          R6           ┌─┴─┐
+  PB1 ── 1 kΩ ──────B──┤   │ Q1
+                       │   │ 2N2222
+                       └─┬─┘ or BC337
+                         E
+                         │
+                        GND
+
+
+ Flyback diode orientation:
+
+       STRIPE → +V
+
+       NON-STRIPED END → transistor collector
+
+
+ D1 can be:
+
+       1N4148
+       1N4001
+       1N4004
+       1N4007
+       etc.
+
+
+ Q1:
+
+       2N2222
+        or
+       BC337
+
+
+ R6:
+
+       1 kΩ
+
+
+
+===============================================================================
+ COMPLETE NET SUMMARY
+===============================================================================
+
+
+ +V RAIL
+ ───────
+     SW1 output
+     Digispark 5V/VCC
+     HT1621 VCC
+     BTN1 15.75 kΩ resistor
+     BTN2 35.16 kΩ resistor
+     BTN3 56.2 kΩ resistor
+     SHIFT 47.0 kΩ resistor
+     buzzer +
+     flyback diode cathode / striped end
+
+
+ GND RAIL
+ ────────
+     battery -
+     Digispark GND
+     HT1621 GND
+     button-ladder 100 kΩ pulldown
+     Q1 emitter
+
+
+ PB0
+ ───
+     HT1621 DATA
+
+
+ PB1
+ ───
+     1 kΩ resistor
+        ↓
+     Q1 transistor base
+
+
+ PB2
+ ───
+     common button-ladder node
+     100 kΩ pulldown to GND
+
+
+ PB3
+ ───
+     HT1621 CS
+
+
+ PB4
+ ───
+     HT1621 WR
+
+
+ PB5 / RESET
+ ───────────
+     no connection
+
+
+
+===============================================================================
+ COMPONENT LIST
+===============================================================================
+
+  U1    Digispark / ATtiny85
+
+  LCD1  HT1621 6-digit reflective LCD module
+
+  BAT1  3 × LR44 battery holder
+
+  SW1   SPST slide power switch
+
+  S1    BTN1 normally-open tactile switch
+  S2    BTN2 normally-open tactile switch
+  S3    BTN3 normally-open tactile switch
+  S4    SHIFT normally-open tactile switch
+
+  R1    15.75 kΩ
+  R2    35.16 kΩ
+  R3    56.2 kΩ
+  R4    47.0 kΩ
+  R5    100 kΩ
+  R6    1 kΩ
+
+  Q1    2N2222 or BC337 NPN transistor
+
+  BZ1   12 mm passive magnetic buzzer
+        approximately 42 Ω
+
+  D1    flyback diode
+        1N4148 / 1N400x
+
+  C1    none fitted
+  C2    none fitted
