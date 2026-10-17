@@ -152,10 +152,10 @@ LANGUAGE_NAMES = {'en': 'English', 'no': 'Norwegian'}
 DEFAULT_TARGETS = {'en': 3, 'no': 2}
 MIN_ORIGINAL_LINE_BREAKS = 50
 # Bump for matching/search changes; unrelated updates must not reopen searches.
-MATCHING_POLICY_REVISION = 4
+MATCHING_POLICY_REVISION = 5
 RETRY_POLICY_REVISION = 1
 AUTO_RETRY_DELAYS = (3600, 6 * 3600, 24 * 3600)
-SCRIPT_VERSION = '2026.10.17.2'
+SCRIPT_VERSION = '2026.10.18.1'
 
 
 def language_group(language):
@@ -528,6 +528,13 @@ class QuotaAwarePool(ProviderPool):
         @wraps(original_criteria)
         def movie_criteria(**kwargs):
             criteria = original_criteria(**kwargs)
+            movie = (kwargs.get('season') is None and kwargs.get('episode') is None
+                     and not kwargs.get('show_imdb_id') and not kwargs.get('show_tmdb_id'))
+            if movie:
+                for criterion in criteria:
+                    # Subliminal has already parsed the filename. Server-side
+                    # guessing treats titles such as "Fahrenheit 451" as episodes.
+                    criterion.update({'type': 'movie', 'no_guessit': 1})
             if kwargs.get('year') is not None:
                 for criterion in criteria:
                     if criterion.get('query'):
@@ -1558,7 +1565,8 @@ def _process_video(path, pool, *, count, minimum, refiners, refiner_configs,
                 print(f'{label} — rejected under this sync policy; skipping. '
                       f"Reason: {marker.data['rejected'][key]}", flush=True)
                 continue
-            if attempts + len(existing) >= wanted:
+            filled = len(existing) + attempts if dry_run else len(marker.files(code))
+            if filled >= wanted:
                 break
             target = next_output_path(path, subtitle.hearing_impaired, reserved, code)
             if dry_run:
@@ -1570,6 +1578,14 @@ def _process_video(path, pool, *, count, minimum, refiners, refiner_configs,
             print(f'{label} — downloading', flush=True)
             attempts += 1
             if not pool.download_subtitle(subtitle):
+                if (subtitle.content and subtitle.subtitle_format == 'srt'
+                        and not subtitle.is_valid()):
+                    # Cache a confirmed malformed SRT, but leave empty/network
+                    # failures eligible for a later automatic retry.
+                    marker.data['rejected'][key] = 'Downloaded SRT is invalid.'
+                    marker.data['rejection_revisions'][key] = MATCHING_POLICY_REVISION
+                    marker.retry_rejected_keys.discard(key)
+                    marker.save()
                 print('  Download failed; existing files are untouched.', flush=True)
                 continue
             if not subtitle.convert(output_format='srt', output_encoding='utf-8',
@@ -1622,7 +1638,7 @@ def main(argv=None):
     parser.add_argument('-c', '--config', type=Path,
                         default=user_config_path('subliminal') / 'subliminal.toml')
     parser.add_argument('-n', '--count', type=int, choices=range(1, 6), default=3,
-                        help='English alternatives/download attempts per video (default: 3). Norwegian is fixed at 2.')
+                        help='English subtitle files per video (default: 3). Norwegian is fixed at 2.')
     parser.add_argument('-m', '--min-score', type=int, choices=range(101), metavar='0..100',
                         help='Legacy setting; the sync fallback has no minimum match-score cutoff.')
     parser.add_argument('-p', '--provider', action='append', help='Override providers; repeat as needed.')
