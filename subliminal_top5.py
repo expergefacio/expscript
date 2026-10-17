@@ -86,6 +86,16 @@ getsubs "videofile.mkv"
 
 getsubs > log.log 2>&1
     Scan and write all output to a log.
+
+
+    for ref, if you want to run FFSUBSYNC on its own:
+    
+"$HOME/.local/share/pipx/venvs/subliminal/bin/ffsubsync" \
+    "Example S01E02.mkv" \
+    -i "Example S01E02.en.hi.srt" \
+    -o "Example S01E02.en.synced.hi.srt"
+
+
 """
 
 
