@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+# mkvtomp4 — NVIDIA-accelerated video compression for Ubuntu
+#
+# INSTALL REQUIREMENTS
+#   sudo apt update
+#   sudo apt install python3 ffmpeg curl wget ca-certificates
+#
+# Requires a working NVIDIA driver and FFmpeg built with h264_nvenc,
+# CUDA decoding and scale_cuda. No pip packages required.
+# Developed and run on an NVIDIA T400 4 GB.
+#
+# Check GPU/FFmpeg support:
+#   nvidia-smi
+#   ffmpeg -hide_banner -encoders | grep h264_nvenc
+#   ffmpeg -hide_banner -filters | grep scale_cuda
+#
+# INSTALL WITH CURL (run in Bash or Zsh)
+# Upload this file as mkvtomp4 at the repository root on main first.
+# /usr/local/bin is normally already on Ubuntu's PATH.
+#
+#   (
+#       set -e
+#       download_dir=$(mktemp -d)
+#       trap 'rm -rf "$download_dir"' EXIT
+#       curl -fL --retry 3 https://raw.githubusercontent.com/expergefacio/expscript/main/mkvtomp4 -o "$download_dir/mkvtomp4"
+#       sudo install -d -m 755 /usr/local/bin
+#       sudo install -m 755 "$download_dir/mkvtomp4" /usr/local/bin/mkvtomp4
+#   )
+#
+# OR INSTALL WITH WGET
+#
+#   (
+#       set -e
+#       download_dir=$(mktemp -d)
+#       trap 'rm -rf "$download_dir"' EXIT
+#       wget --tries=3 -O "$download_dir/mkvtomp4" https://raw.githubusercontent.com/expergefacio/expscript/main/mkvtomp4
+#       sudo install -d -m 755 /usr/local/bin
+#       sudo install -m 755 "$download_dir/mkvtomp4" /usr/local/bin/mkvtomp4
+#   )
+#
+# OPTIONAL: INSTALL YT-DLP WITH CURL
+# yt-dlp is a separate downloader; mkvtomp4 does not require it.
+#
+#   (
+#       set -e
+#       download_dir=$(mktemp -d)
+#       trap 'rm -rf "$download_dir"' EXIT
+#       curl -fL --retry 3 https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$download_dir/yt-dlp"
+#       sudo install -d -m 755 /usr/local/bin
+#       sudo install -m 755 "$download_dir/yt-dlp" /usr/local/bin/yt-dlp
+#   )
+#
+# OR INSTALL YT-DLP WITH WGET
+#
+#   (
+#       set -e
+#       download_dir=$(mktemp -d)
+#       trap 'rm -rf "$download_dir"' EXIT
+#       wget --tries=3 -O "$download_dir/yt-dlp" https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp
+#       sudo install -d -m 755 /usr/local/bin
+#       sudo install -m 755 "$download_dir/yt-dlp" /usr/local/bin/yt-dlp
+#   )
+#
+# yt-dlp requirements and site-specific dependencies:
+#   https://github.com/yt-dlp/yt-dlp#readme
+#
+# USAGE
+#   mkvtomp4 "episode.mkv"   Convert one file.
+#   mkvtomp4                 Convert videos directly in the current folder.
+#
+# Output: compressed/episode.compressed.mp4 beside each source.
+# No recursion or symlink following. Batch conversion is sequential;
+# existing outputs are skipped, failures are reported and processing continues.
+# Originals are retained. Ctrl+C stops the batch.
+#
+# SETTINGS
+# Edit the variables below; there are no command-line flags.
+# Installed copy: sudo nano /usr/local/bin/mkvtomp4
+# Defaults: 0.9 decimal GB/hour maximum total size, p7, maximum 24 fps,
+# original resolution, AAC-LC stereo at 128 kbps for each audio track.
+# Video targets 90% of the calculated budget, with a peak allowance of
+# twice that budget and a buffer of four times it. Finished size is checked;
+# up to three attempts are made. Simple content can finish below the cap.
+# Full-resolution NVENC multipass is per-frame analysis, not two whole-file passes.
+#
+# LIMITATIONS
+# Surround sound is downmixed to stereo. HDR and bitmap subtitles are rejected.
+# Embedded text subtitles become embedded mov_text; external subs are not imported.
+# Subtitle styling/positioning and flag support depend on the container/client.
+# Attachments, cover art and extra data streams are omitted; chapters are copied.
+# No deinterlacing is performed. Higher-rate input loses frames at the FPS cap.
+# Output publication requires a filesystem supporting hard links.
+# No guarantee of direct play on every client.
+#
+# UPDATE
+# Re-run an installation block. This replaces local settings edits, so keep
+# your custom values first. If another copy runs, check command -v mkvtomp4
+# or invoke /usr/local/bin/mkvtomp4 explicitly.
+
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+# ========================= SETTINGS =========================
+
+GB_PER_HOUR = 0.9           # 0.7 = About 500 MB for a 43-minute episode.
+PRESET = "p7"                # p1 fastest ... p7 slowest.
+GPU = "0"
+MAX_FPS = 24
+
+AUDIO_BITRATE = 128_000      # Per audio track.
+AUDIO_CHANNELS = 2          # Stereo; retain all audio tracks.
+AUDIO_SAMPLE_RATE = 48_000
+
+SIZE_RESERVE = 0.03
+MAX_ATTEMPTS = 3
+MIN_VIDEO_BITRATE = 250_000
+
+OUTPUT_FOLDER = "compressed"
+OUTPUT_SUFFIX = ".compressed"
+
+FFMPEG = "ffmpeg"
+FFPROBE = "ffprobe"
+
+# Keep original resolution; cap frame rate at MAX_FPS.
+# H.264 8-bit video, AAC-LC stereo audio.
+# All embedded text subtitles become embedded MP4 mov_text.
+# Existing external subtitle files are not imported or modified.
+# HDR and image-based subtitles are rejected.
+# Original files are never deleted or replaced.
+
+# ============================================================
+
+
+VIDEO_EXTENSIONS = {
+    ".mkv", ".mp4", ".m4v", ".avi", ".mov",
+    ".ts", ".m2ts", ".mts", ".mpg", ".mpeg",
+    ".wmv", ".webm", ".flv", ".vob",
+}
+
+TEXT_SUBTITLE_CODECS = {
+    "subrip", "srt", "ass", "ssa", "webvtt", "mov_text",
+    "text", "microdvd", "mpl2", "jacosub", "sami", "realtext",
+    "subviewer", "subviewer1", "vplayer", "pjs",
+}
+
+HANDLED_ERRORS = (
+    RuntimeError,
+    OSError,
+    ValueError,
+    KeyError,
+    subprocess.CalledProcessError,
+)
+
+
+def probe(path):
+    result = subprocess.run(
+        [
+            FFPROBE, "-v", "error",
+            "-show_format", "-show_streams",
+            "-of", "json", str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def validate_settings():
+    for executable in (FFMPEG, FFPROBE):
+        if not shutil.which(executable):
+            raise RuntimeError(
+                f"Required executable not found: {executable}"
+            )
+
+    if (
+        not math.isfinite(GB_PER_HOUR)
+        or GB_PER_HOUR <= 0
+        or not 0 < SIZE_RESERVE < 1
+        or MAX_ATTEMPTS < 1
+        or AUDIO_BITRATE <= 0
+        or AUDIO_CHANNELS != 2
+        or AUDIO_SAMPLE_RATE <= 0
+        or MIN_VIDEO_BITRATE <= 0
+    ):
+        raise RuntimeError("Invalid settings at the top of the script.")
+
+    if PRESET not in {f"p{number}" for number in range(1, 8)}:
+        raise RuntimeError("PRESET must be p1 through p7.")
+
+    if (
+        not OUTPUT_FOLDER
+        or OUTPUT_FOLDER in {".", ".."}
+        or Path(OUTPUT_FOLDER).name != OUTPUT_FOLDER
+    ):
+        raise RuntimeError("OUTPUT_FOLDER must be a folder name.")
+
+
+def output_path(source):
+    return (
+        source.parent
+        / OUTPUT_FOLDER
+        / (source.stem + OUTPUT_SUFFIX + ".mp4")
+    )
+
+
+def check_destination(path):
+    if path.exists() or path.is_symlink():
+        raise RuntimeError(f"Output already exists: {path}")
+
+
+def subtitle_options(subtitles):
+    options = []
+
+    for number, stream in enumerate(subtitles):
+        tags = stream.get("tags", {})
+        disposition = stream.get("disposition", {})
+
+        language = tags.get("language", "und")
+        title = (
+            tags.get("title")
+            or tags.get("handler_name")
+            or language
+        )
+
+        is_sdh = bool(
+            disposition.get("hearing_impaired")
+            or re.search(
+                r"\b(SDH|HI|CC|hearing impaired|closed captions?)\b",
+                title,
+                re.IGNORECASE,
+            )
+        )
+
+        is_forced = bool(disposition.get("forced"))
+
+        if is_sdh and not re.search(
+            r"\b(SDH|HI|CC)\b", title, re.IGNORECASE
+        ):
+            title += " [SDH]"
+
+        if is_forced and not re.search(
+            r"\bforced\b", title, re.IGNORECASE
+        ):
+            title += " [Forced]"
+
+        flags = []
+
+        if disposition.get("default"):
+            flags.append("default")
+
+        if is_forced:
+            flags.append("forced")
+
+        if is_sdh:
+            flags.append("hearing_impaired")
+
+        options += [
+            f"-metadata:s:s:{number}", f"language={language}",
+            f"-metadata:s:s:{number}", f"title={title}",
+            f"-metadata:s:s:{number}", f"handler_name={title}",
+            f"-disposition:s:{number}",
+            "+".join(flags) if flags else "0",
+        ]
+
+    return options
+
+
+def verify_output(path, audio_count, subtitle_count, duration):
+    info = probe(path)
+
+    videos = [
+        stream for stream in info["streams"]
+        if stream["codec_type"] == "video"
+    ]
+    audio = [
+        stream for stream in info["streams"]
+        if stream["codec_type"] == "audio"
+    ]
+    subtitles = [
+        stream for stream in info["streams"]
+        if stream["codec_type"] == "subtitle"
+    ]
+
+    if len(videos) != 1 or videos[0]["codec_name"] != "h264":
+        raise RuntimeError("Output video verification failed.")
+
+    if videos[0].get("pix_fmt") not in {"yuv420p", "yuvj420p"}:
+        raise RuntimeError("Output video is not 8-bit 4:2:0.")
+
+    if len(audio) != audio_count:
+        raise RuntimeError("Output audio track count does not match.")
+
+    for stream in audio:
+        if (
+            stream["codec_name"] != "aac"
+            or stream.get("channels") != AUDIO_CHANNELS
+        ):
+            raise RuntimeError("Output audio format verification failed.")
+
+    if len(subtitles) != subtitle_count:
+        raise RuntimeError("Output subtitle track count does not match.")
+
+    if any(
+        stream["codec_name"] != "mov_text"
+        for stream in subtitles
+    ):
+        raise RuntimeError("Output subtitle format verification failed.")
+
+    actual_duration = float(info["format"].get("duration", 0))
+
+    if (
+        not math.isfinite(actual_duration)
+        or abs(actual_duration - duration)
+        > max(2, duration * 0.001)
+    ):
+        raise RuntimeError(
+            "Output duration differs unexpectedly from input."
+        )
+
+
+def process_file(source):
+    source = Path(os.path.abspath(source.expanduser()))
+
+    if source.is_symlink():
+        raise RuntimeError(f"Symlink inputs are not followed: {source}")
+
+    if not source.is_file():
+        raise RuntimeError(f"Input file not found: {source}")
+
+    output = output_path(source)
+    output_dir = output.parent
+
+    if output_dir.is_symlink():
+        raise RuntimeError(
+            f"Output directory must not be a symlink: {output_dir}"
+        )
+
+    output_dir.mkdir(exist_ok=True)
+    check_destination(output)
+
+    info = probe(source)
+
+    videos = [
+        stream for stream in info["streams"]
+        if stream["codec_type"] == "video"
+        and not stream.get("disposition", {}).get("attached_pic")
+    ]
+    audio = [
+        stream for stream in info["streams"]
+        if stream["codec_type"] == "audio"
+    ]
+    subtitles = [
+        stream for stream in info["streams"]
+        if stream["codec_type"] == "subtitle"
+    ]
+
+    if len(videos) != 1:
+        raise RuntimeError("Expected exactly one main video stream.")
+
+    video = videos[0]
+
+    if video.get("color_transfer") in {"smpte2084", "arib-std-b67"}:
+        raise RuntimeError(
+            "HDR input needs a separate tone-mapping workflow."
+        )
+
+    unsupported = [
+        stream for stream in subtitles
+        if stream.get("codec_name") not in TEXT_SUBTITLE_CODECS
+    ]
+
+    if unsupported:
+        details = ", ".join(
+            f"track {stream['index']} "
+            f"({stream.get('codec_name', 'unknown')})"
+            for stream in unsupported
+        )
+        raise RuntimeError(
+            "Unsupported subtitle tracks "
+            f"(bitmap formats require OCR): {details}"
+        )
+
+    duration = float(info["format"].get("duration", 0))
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("Could not determine a valid input duration.")
+
+    cap = int(GB_PER_HOUR * 1_000_000_000 * duration / 3600)
+
+    audio_budget = len(audio) * AUDIO_BITRATE * duration / 8
+
+    bitrate = int(
+        (cap * (1 - SIZE_RESERVE) - audio_budget)
+        * 8 / duration
+    )
+
+    print(f"Input:  {source}", flush=True)
+    print(f"Output: {output}", flush=True)
+    print(
+        f"Keeping {video.get('width')}x{video.get('height')}; "
+        f"H.264 NVENC {PRESET}",
+        flush=True,
+    )
+    print(
+        f"Audio: {len(audio)} track(s), AAC-LC stereo "
+        f"{AUDIO_BITRATE // 1000} kbps each",
+        flush=True,
+    )
+    print(
+        f"Subtitles: {len(subtitles)} track(s), embedded mov_text",
+        flush=True,
+    )
+    print(
+        f"Total size limit: {cap / 1e6:.1f} MB "
+        f"({GB_PER_HOUR} GB/hour)",
+        flush=True,
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix=".mkvtomp4-",
+        dir=output_dir,
+    ) as directory:
+        temporary = Path(directory) / output.name
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            if bitrate < MIN_VIDEO_BITRATE:
+                raise RuntimeError(
+                    "Audio/subtitles leave too little room for video. "
+                    "Increase GB_PER_HOUR."
+                )
+
+            print(
+                f"Attempt {attempt}: video target "
+                f"{int(bitrate * 0.9) / 1e6:.2f} Mbps",
+                flush=True,
+            )
+
+            command = [
+                FFMPEG,
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+
+                "-hwaccel", "cuda",
+                "-hwaccel_device", GPU,
+                "-hwaccel_output_format", "cuda",
+                "-i", str(source),
+
+                "-map", f"0:{video['index']}",
+                "-map", "0:a?",
+                "-map", "0:s?",
+                "-map_metadata", "0",
+                "-map_chapters", "0",
+
+                "-vf", "scale_cuda=format=nv12",
+
+                "-c:v", "h264_nvenc",
+                "-gpu", GPU,
+                "-preset", PRESET,
+                "-tune", "hq",
+                "-multipass", "fullres",
+
+                "-rc", "vbr",
+                "-b:v", str(int(bitrate * 0.9)),
+                "-maxrate:v", str(bitrate * 2),
+                "-bufsize:v", str(bitrate * 4),
+
+                "-spatial-aq", "1",
+                "-temporal-aq", "1",
+                "-aq-strength", "8",
+                "-rc-lookahead", "32",
+
+                "-profile:v", "high",
+                "-fpsmax:v", str(MAX_FPS),
+                "-fps_mode:v", "cfr",
+            ]
+
+            if audio:
+                command += [
+                    "-c:a", "aac",
+                    "-profile:a", "aac_low",
+                    "-b:a", str(AUDIO_BITRATE),
+                    "-ac:a", str(AUDIO_CHANNELS),
+                    "-ar:a", str(AUDIO_SAMPLE_RATE),
+                ]
+
+            if subtitles:
+                command += ["-c:s", "mov_text"]
+                command += subtitle_options(subtitles)
+
+            command += [
+                "-max_muxing_queue_size", "4096",
+                "-movflags", "+faststart",
+                str(temporary),
+            ]
+
+            subprocess.run(command, check=True)
+
+            size = temporary.stat().st_size
+
+            if size <= cap:
+                break
+
+            overshoot = (size - cap) * 8 / duration
+            bitrate = int((bitrate - overshoot) * 0.97)
+
+            print(
+                "Output exceeded size limit; "
+                "lowering bitrate and retrying.",
+                flush=True,
+            )
+
+        else:
+            raise RuntimeError(
+                "Could not meet the size limit. "
+                "No final output created."
+            )
+
+        verify_output(
+            temporary,
+            len(audio),
+            len(subtitles),
+            duration,
+        )
+
+        check_destination(output)
+
+        # Atomically create the finished output without overwriting.
+        # Temporary files are on the same filesystem.
+        os.link(temporary, output)
+
+        print(
+            f"\nSaved: {output}\n"
+            f"Size: {size / 1e6:.1f} MB\n"
+            f"Actual: {size * 3600 / duration / 1e9:.3f} GB/hour\n"
+            f"Embedded subtitle tracks: {len(subtitles)}\n"
+            "Original files retained.",
+            flush=True,
+        )
+
+
+def main():
+    if len(sys.argv) > 2:
+        raise RuntimeError('Usage: mkvtomp4 ["filename"]')
+
+    validate_settings()
+
+    # One argument: convert only that file.
+    if len(sys.argv) == 2:
+        process_file(Path(sys.argv[1]))
+        return
+
+    # No arguments: immediate files only; no recursion or symlinks.
+    files = sorted(
+        (
+            path
+            for path in Path.cwd().iterdir()
+            if not path.is_symlink()
+            and path.is_file()
+            and path.suffix.lower() in VIDEO_EXTENSIONS
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+
+    if not files:
+        print("No video files found in the current directory.")
+        return
+
+    succeeded = 0
+    skipped = 0
+    failed = []
+
+    print(
+        f"Found {len(files)} video file(s). "
+        f"Output folder: {Path.cwd() / OUTPUT_FOLDER}",
+        flush=True,
+    )
+
+    for number, source in enumerate(files, 1):
+        print(
+            f"\n========== {number}/{len(files)}: "
+            f"{source.name} ==========",
+            flush=True,
+        )
+
+        output = output_path(source)
+
+        if output.exists() or output.is_symlink():
+            print(
+                f"Skipping existing output: {output.name}",
+                flush=True,
+            )
+            skipped += 1
+            continue
+
+        try:
+            process_file(source)
+            succeeded += 1
+
+        except HANDLED_ERRORS as error:
+            print(
+                f"FAILED: {source.name}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            failed.append(source.name)
+
+    print(
+        f"\nFinished: {succeeded} converted, "
+        f"{skipped} skipped, {len(failed)} failed.",
+        flush=True,
+    )
+
+    if failed:
+        raise RuntimeError(
+            "Failed files:\n"
+            + "\n".join(f"  {name}" for name in failed)
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        sys.exit("\nCancelled.")
+
+    except HANDLED_ERRORS as error:
+        sys.exit(f"mkvtomp4: {error}")
