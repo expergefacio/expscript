@@ -87,6 +87,9 @@ getsubs "videofile.mkv"
 getsubs > log.log 2>&1
     Scan and write all output to a log.
 
+getsubs 2>&1 | tee log.log
+    log and output
+
 
     for ref, if you want to run FFSUBSYNC on its own:
     
